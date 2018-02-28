@@ -10,177 +10,199 @@ import pygame
 import threading
 import urllib
 
+
 def dict_factory(cursor, row):
-	d = {}
-	for idx, col in enumerate(cursor.description):
-		d[col[0]] = row[idx]
-	return d
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
+
 
 class DaemonApp(object):
-	def __init__(self):
-		self.stdin_path = '/dev/null'
-		self.stdout_path = '/dev/null'
-		self.stderr_path = '/dev/null'
-		self.pidfile_path =  '/var/run/door.pid'
-		self.pidfile_timeout = 5
+    def __init__(self):
+        self.stdin_path = '/dev/null'
+        self.stdout_path = '/dev/null'
+        self.stderr_path = '/dev/null'
+        self.pidfile_path = '/var/run/door.pid'
+        self.pidfile_timeout = 5
 
-		self.running = True
-		self.log = logging.getLogger("daemon")
+        self.running = True
+        self.log = logging.getLogger("daemon")
 
-	def __halt(self):
-		self.running = False
+    def __halt(self):
+        self.running = False
 
-	def run(self):
-		atexit.register(self.__halt)
+    def run(self):
+        atexit.register(self.__halt)
 
-		self.setup()
-		while self.running:
-			try:
-				self.loop()
-			except KeyboardInterrupt:
-				break
-			except Exception as ex:
-				self.log.exception(ex)
-				break
+        self.setup()
+        while self.running:
+            try:
+                self.loop()
+            except KeyboardInterrupt:
+                break
+            except Exception as ex:
+                self.log.exception(ex)
+                break
 
-		self.stop()
+        self.stop()
 
-	def setup(self):
-		pass
+    def setup(self):
+        pass
 
-	def stop(self):
-		pass
+    def stop(self):
+        pass
 
-	def loop(self):
-		pass
+    def loop(self):
+        pass
+
 
 class App(DaemonApp):
-	def __init__(self, serial, db_file):
-		super(App, self).__init__();
+    def __init__(self, serial, db_file):
+        super(App, self).__init__();
 
-		self.serial = serial
-		self.db_file = db_file
-		
-		self.recent = {}
+        self.serial = serial
+        self.db_file = db_file
 
-	def setup(self):
-		self.log.info("starting")
+        self.recent = {}
 
-		GPIO.setwarnings(False)
-		GPIO.setmode(GPIO.BCM)
-		GPIO.setup(17, GPIO.OUT)
-		GPIO.output(17, GPIO.LOW)
+    def setup(self):
+        self.log.info("starting")
 
-	def loop(self):
-		card = self.serial.readline()
-		if not card:
-			return
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(17, GPIO.OUT)
+        GPIO.output(17, GPIO.LOW)
 
-		card = card.strip()
-		if len(card) != 10:
-			return
+    def is_sane(self, card):
+        """
+		do a modicum of validation to avoid SQL injection or other abuse.
+		allowed_characters may need to be tweaked if card IDs may include
+		other characters...
 
-		now = time.time()
-		if card in self.recent:
-			if now - self.recent[card] < 5.0:
-				self.recent[card] = now
-				return
+		:returns: A boolean indicating whether the card input is
+				  indeed a sane value.
+		"""
 
-		self.recent[card] = now
+        allowed_characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
-		self.handle_card_read(card)
+        if len(card) != 10:
+            return False
 
-	def stop(self):
-		self.log.info("stopping")
+        for char in card.upper():
+            if char not in allowed_characters:
+                return False
 
-	def handle_card_read(self, card):
-		db = sqlite3.connect(self.db_file)
-		db.row_factory = dict_factory
-                baseurl = "http://my.protospace.ca/locks/door/108A/"
+    def loop(self):
+        card = self.serial.readline()
+        if not card:
+            return
 
-		self.unify_serial_numbers(db, card)
+        card = card.strip()
+        if not self.is_sane(card):
+            return
 
-		# TODO flag duplicates
-		cards = self.query_cards(db, card)
-		if cards:
-			card = cards.pop(0)
+        now = time.time()
+        if card in self.recent:
+            if now - self.recent[card] < 5.0:
+                self.recent[card] = now
+                return
 
-			# TODO merge duplicate values
-			for temp in cards:
-				pass
+        self.recent[card] = now
 
-			self.update_timestamp(db, card['serial'])
-			if not card['active']:
-				self.log.warn("%s[%s] denied access" % (card["owner"], card['serial']))
-                                urlaction = "DENIED"
-                                rfid = "%s" % card['serial']
+        self.handle_card_read(card)
 
-			else:
-				self.log.info("%s[%s] entered the space" % (card["owner"], card['serial']))
-                                urlaction = "ALLOWED"
-                                rfid = "%s" % card['serial']
+    def stop(self):
+        self.log.info("stopping")
 
-				threading.Thread(target=self.unlock_door, kwargs={"duration": 5.0}).start()
+    def handle_card_read(self, card):
+        db = sqlite3.connect(self.db_file)
+        db.row_factory = dict_factory
+        baseurl = "http://my.protospace.ca/locks/door/108A/"
 
-		else:
-			self.log.info("Card read: %s" % (card,))
-                        rfid = "%s" % (card,)
-                        urlaction = "NOT IN DB"
+        self.unify_serial_numbers(db, card)
 
-		url = baseurl + rfid + "/" + urlaction
-        
-		try:
-			response = urllib.urlopen(url).read()
-			self.log.info("Web log response was %s" % (response))
-		except:
-			self.log.warn("A generic error occurred on the web call.")
-			
-		db.close()
+        # TODO flag duplicates
+        cards = self.query_cards(db, card)
+        if cards:
+            card = cards.pop(0)
 
-	def unify_serial_numbers(self, db, card):
-		q = "UPDATE cards SET serial='%s' WHERE serial='%s'" % (card, card[::-1])
-		db.execute(q)
+            # TODO merge duplicate values
+            for temp in cards:
+                pass
 
-	def update_scan_log(self, db, card):
-		q = "INSERT INTO scan_logs"
+            self.update_timestamp(db, card['serial'])
+            if not card['active']:
+                self.log.warn("%s[%s] denied access" % (card["owner"], card['serial']))
+                urlaction = "DENIED"
+                rfid = "%s" % card['serial']
 
-	def update_timestamp(self, db, card):
-		q = "UPDATE cards SET first_seen = datetime('now') WHERE serial = '%s' AND first_seen IS NULL" % (card)
-		db.execute(q)
+            else:
+                self.log.info("%s[%s] entered the space" % (card["owner"], card['serial']))
+                urlaction = "ALLOWED"
+                rfid = "%s" % card['serial']
 
-		q = "UPDATE cards SET last_seen = datetime('now') WHERE serial = '%s'" % (card)
-		db.execute(q)
+                threading.Thread(target=self.unlock_door, kwargs={"duration": 5.0}).start()
 
-		db.commit()
+        else:
+            self.log.info("Card read: %s" % (card,))
+            rfid = "%s" % (card,)
+            urlaction = "NOT IN DB"
 
-	def unlock_door(self, duration):
-		GPIO.output(17, GPIO.HIGH)
-		time.sleep(duration)
-		GPIO.output(17, GPIO.LOW)
+        url = baseurl + rfid + "/" + urlaction
 
-	def play_sound(self, path):
-		if not (path and os.path.exists(path)):
-			return
+        try:
+            response = urllib.urlopen(url).read()
+            self.log.info("Web log response was %s" % (response))
+        except:
+            self.log.warn("A generic error occurred on the web call.")
 
-		if not pygame.mixer.music.get_busy():
-			try:
-				pygame.mixer.music.load(path)
-				pygame.mixer.music.play()
-			except:
-				self.log.warn("Failed to play sound '%s'" % (path))
+        db.close()
 
-	def query_cards(self, db, card):
-		cur = db.cursor()
-		query = "SELECT * FROM cards WHERE serial='%s' ORDER BY id ASC" % card
-		cur.execute(query)
+    def unify_serial_numbers(self, db, card):
+        q = "UPDATE cards SET serial='%s' WHERE serial='%s'" % (card, card[::-1])
+        db.execute(q)
 
-		cards = []
+    def update_scan_log(self, db, card):
+        q = "INSERT INTO scan_logs"
 
-		row = cur.fetchone()
-		while row:
-			cards.append(row)
-			row = cur.fetchone()
+    def update_timestamp(self, db, card):
+        q = "UPDATE cards SET first_seen = datetime('now') WHERE serial = '%s' AND first_seen IS NULL" % (card)
+        db.execute(q)
 
-		self.log.debug(cards)
+        q = "UPDATE cards SET last_seen = datetime('now') WHERE serial = '%s'" % (card)
+        db.execute(q)
 
-		return cards
+        db.commit()
+
+    def unlock_door(self, duration):
+        GPIO.output(17, GPIO.HIGH)
+        time.sleep(duration)
+        GPIO.output(17, GPIO.LOW)
+
+    def play_sound(self, path):
+        if not (path and os.path.exists(path)):
+            return
+
+        if not pygame.mixer.music.get_busy():
+            try:
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.play()
+            except:
+                self.log.warn("Failed to play sound '%s'" % (path))
+
+    def query_cards(self, db, card):
+        cur = db.cursor()
+        query = "SELECT * FROM cards WHERE serial='%s' ORDER BY id ASC" % card
+        cur.execute(query)
+
+        cards = []
+
+        row = cur.fetchone()
+        while row:
+            cards.append(row)
+            row = cur.fetchone()
+
+        self.log.debug(cards)
+
+        return cards
